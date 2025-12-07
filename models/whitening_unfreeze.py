@@ -16,7 +16,6 @@ import sys
 import random
 import numpy as np
 # import uuid
-import math
 from math import ceil
 
 from datetime import datetime
@@ -60,9 +59,9 @@ hyp = {
         'momentum': 0.85,
         'weight_decay': 0.0153,     # weight decay per 1024 examples (decoupled from learning rate)
         'bias_scaler': 64.0,        # scales up learning rate (but not weight decay) for BatchNorm biases
-        'label_smoothing': 0.40,   # strong early smoothing
-        'label_smoothing_final': 0.00,  # we still end at hard labels
+        'label_smoothing': 0.2,
         'whiten_bias_epochs': 3,    # how many epochs to train the whitening layer bias before freezing
+        'whiten_unfreeze_epoch': 7,  # NEW: start training whitening conv weights at epoch 7
     },
     'aug': {
         'flip': True,
@@ -372,58 +371,6 @@ def evaluate(model, loader, tta_level=0):
     logits = infer(model, loader, tta_level)
     return (logits.argmax(1) == loader.labels).float().mean().item()
 
-def label_smoothing_loss(logits, targets, smoothing, num_classes=10):
-    """
-    Per-example cross-entropy with label smoothing.
-    logits: [N, num_classes]
-    targets: [N] int64
-    smoothing: float in [0, 1)
-    returns: [N] loss values, one per example
-    """
-    # Work in float32 for numerical stability
-    logits = logits.float()
-    log_probs = F.log_softmax(logits, dim=1)
-
-    if smoothing <= 0.0:
-        # Standard NLL loss without smoothing
-        return F.nll_loss(log_probs, targets, reduction="none")
-
-    with torch.no_grad():
-        true_dist = torch.zeros_like(log_probs)
-        true_dist.fill_(smoothing / (num_classes - 1))
-        true_dist.scatter_(1, targets.unsqueeze(1), 1.0 - smoothing)
-
-    return (-true_dist * log_probs).sum(dim=1)
-
-def get_smoothing(step, total_steps, ls_start, ls_end):
-    """
-    Piecewise label smoothing schedule:
-      - First 70% of steps: constant high smoothing (ls_start)
-      - Last 30% of steps: cosine decay from ls_start -> ls_end
-    """
-    if total_steps <= 0:
-        return ls_start
-
-    warm_frac = 0.7
-    warm_steps = int(total_steps * warm_frac)
-
-    # Guard against corner cases
-    step = max(0, min(step, total_steps))
-
-    if step < warm_steps:
-        # Early phase: strong, constant smoothing
-        return ls_start
-
-    # Late phase: cosine decay from ls_start -> ls_end
-    remaining = total_steps - warm_steps
-    if remaining <= 0:
-        return ls_end
-
-    t = (step - warm_steps) / remaining  # goes 0 -> 1 over late phase
-    # Cosine goes 1 -> 0 as t goes 0 -> 1
-    cosine = 0.5 * (1 + math.cos(math.pi * t))
-    return ls_end + (ls_start - ls_end) * cosine
-
 ############################################
 #                Training                  #
 ############################################
@@ -448,9 +395,8 @@ def main(run):
     lr = hyp['opt']['lr'] / kilostep_scale # un-decoupled learning rate for PyTorch SGD
     wd = hyp['opt']['weight_decay'] * batch_size / kilostep_scale
     lr_biases = lr * hyp['opt']['bias_scaler']
-    ls_start = hyp['opt']['label_smoothing']
-    ls_end = hyp['opt']['label_smoothing_final']
-    num_classes = 10
+
+    loss_fn = nn.CrossEntropyLoss(label_smoothing=hyp['opt']['label_smoothing'], reduction='none')
     test_loader = CifarLoader(CIFAR_ROOT, train=False, batch_size=2000)
     train_loader = CifarLoader(CIFAR_ROOT, train=True, batch_size=batch_size, aug=hyp['aug'])
     if run == 'warmup':
@@ -461,10 +407,29 @@ def main(run):
     model = make_net()
     current_steps = 0
 
-    norm_biases = [p for k, p in model.named_parameters() if 'norm' in k and p.requires_grad]
-    other_params = [p for k, p in model.named_parameters() if 'norm' not in k and p.requires_grad]
-    param_configs = [dict(params=norm_biases, lr=lr_biases, weight_decay=wd/lr_biases),
-                     dict(params=other_params, lr=lr, weight_decay=wd/lr)]
+    # Separate param groups:
+    #  - whitening conv weights (model[0].weight)
+    #  - BatchNorm biases ("norm" in name)
+    #  - all other trainable parameters
+    whiten_params = [model[0].weight]
+    norm_biases = []
+    other_params = []
+
+    for name, p in model.named_parameters():
+        if p is model[0].weight:
+            # already in whiten_params
+            continue
+        if 'norm' in name and p.requires_grad:
+            norm_biases.append(p)
+        elif p.requires_grad:
+            other_params.append(p)
+
+    param_configs = [
+        dict(params=whiten_params, lr=lr,        weight_decay=wd),             # whitening conv
+        dict(params=norm_biases,  lr=lr_biases, weight_decay=wd / lr_biases),  # BN biases
+        dict(params=other_params, lr=lr,        weight_decay=wd),             # everything else
+    ]
+
     optimizer = torch.optim.SGD(param_configs, momentum=momentum, nesterov=True)
 
     def get_lr(step):
@@ -497,7 +462,14 @@ def main(run):
 
     for epoch in range(ceil(epochs)):
 
+        # Biases: train for a few epochs, then freeze (original behavior)
         model[0].bias.requires_grad = (epoch < hyp['opt']['whiten_bias_epochs'])
+
+        # NEW: late unfreezing of whitening conv weights
+        if epoch >= hyp['opt']['whiten_unfreeze_epoch']:
+            model[0].weight.requires_grad = True
+        else:
+            model[0].weight.requires_grad = False
 
         ####################
         #     Training     #
@@ -508,13 +480,8 @@ def main(run):
         model.train()
         for inputs, labels in train_loader:
 
-            # Compute current label smoothing based on piecewise schedule
-            smoothing = get_smoothing(current_steps, total_train_steps, ls_start, ls_end)
-
             outputs = model(inputs)
-            per_example_loss = label_smoothing_loss(outputs, labels, smoothing, num_classes=num_classes)
-            loss = per_example_loss.sum()
-
+            loss = loss_fn(outputs, labels).sum()
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
@@ -544,14 +511,12 @@ def main(run):
         val_acc = evaluate(model, test_loader, tta_level=0)
         print_training_details(locals(), is_final_entry=False)
         run = None # Only print the run number once
-        epoch_smoothing = get_smoothing(current_steps, total_train_steps, ls_start, ls_end)
-
         history.append({
             "epoch": int(epoch),
             "train_loss": float(train_loss),
             "train_acc": float(train_acc),
             "val_acc": float(val_acc),
-            "label_smoothing": float(epoch_smoothing),
+            "whiten_trainable": bool(model[0].weight.requires_grad),
             "total_time_seconds": float(total_time_seconds),
         })
 
@@ -597,7 +562,7 @@ if __name__ == "__main__":
     with open(sys.argv[0]) as f:
         code = f.read()
 
-    exp_name = "dynamic_ls"
+    exp_name = "whiten_unfreeze"
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
 
     log_dir = os.path.join(PROJECT_ROOT, "logs", exp_name, run_id)
