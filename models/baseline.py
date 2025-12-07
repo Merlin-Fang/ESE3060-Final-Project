@@ -15,11 +15,10 @@ import os
 import sys
 import random
 import numpy as np
-import uuid
+# import uuid
 from math import ceil
 
 from datetime import datetime
-from tqdm import tqdm
 
 import torch
 from torch import nn
@@ -497,7 +496,11 @@ def main(run):
     #  TTA Evaluation  #
     ####################
 
+    starter.record()
     tta_val_acc = evaluate(model, test_loader, tta_level=hyp['net']['tta_level'])
+    ender.record()
+    torch.cuda.synchronize()
+    total_time_seconds += 1e-3 * starter.elapsed_time(ender)
 
     epoch = 'eval'
     print_training_details(locals(), is_final_entry=True)
@@ -532,10 +535,10 @@ if __name__ == "__main__":
         print_columns(logging_columns_list, is_head=True)
         # main('warmup')  # optional warmup, can leave commented
 
-        run_logs = [main(run) for run in tqdm(range(25), desc="Baseline runs")]
+        run_logs = [main(run) for run in range(25)]
 
         accs = torch.tensor([rl["tta_val_acc"] for rl in run_logs])
-        times = torch.tensor([rl["total_time_seconds"] for rl in run_logs])
+        times = torch.tensor([rl["history"][-1]["total_time_seconds"] for rl in run_logs])
 
         print("Mean accuracy: %.4f    Std: %.4f" % (accs.mean(), accs.std()))
         print("Mean training time (s): %.4f    Std: %.4f" % (times.mean(), times.std()))
