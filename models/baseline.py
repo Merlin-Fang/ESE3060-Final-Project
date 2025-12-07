@@ -537,8 +537,10 @@ if __name__ == "__main__":
 
         run_logs = [main(run) for run in range(25)]
 
-        accs = torch.tensor([rl["tta_val_acc"] for rl in run_logs])
-        times = torch.tensor([rl["history"][-1]["total_time_seconds"] for rl in run_logs])
+        effective_logs = run_logs[1:]
+
+        accs = torch.tensor([rl["tta_val_acc"] for rl in effective_logs])
+        times = torch.tensor([rl["history"][-1]["total_time_seconds"] for rl in effective_logs])
 
         print("Mean accuracy: %.4f    Std: %.4f" % (accs.mean(), accs.std()))
         print("Mean training time (s): %.4f    Std: %.4f" % (times.mean(), times.std()))
