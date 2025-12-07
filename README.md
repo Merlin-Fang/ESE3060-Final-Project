@@ -21,8 +21,6 @@ At a high level:
 - `logs/`
   - Created automatically when you run any model script.
   - Structure: `logs/<exp_name>/<timestamp>/log.pt` and `log.txt`.
-- `requirements.txt`
-  - 
 
 ### Prerequisites
 - Python 3.8+
