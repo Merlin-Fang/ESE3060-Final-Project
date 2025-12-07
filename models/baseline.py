@@ -496,19 +496,34 @@ def main(run):
     #  TTA Evaluation  #
     ####################
 
+    # Time TTA evaluation separately, but do NOT add it into total_time_seconds
     starter.record()
     tta_val_acc = evaluate(model, test_loader, tta_level=hyp['net']['tta_level'])
     ender.record()
     torch.cuda.synchronize()
-    total_time_seconds += 1e-3 * starter.elapsed_time(ender)
+    tta_time_seconds = 1e-3 * starter.elapsed_time(ender)
+
+    # For the eval row, report training + TTA time,
+    # while keeping total_time_seconds as training-only.
+    eval_total_time_seconds = total_time_seconds + tta_time_seconds
 
     epoch = 'eval'
-    print_training_details(locals(), is_final_entry=True)
+    eval_vars = {
+        "run": run,                    # will be None so the column is blank
+        "epoch": epoch,
+        "train_loss": train_loss,
+        "train_acc": train_acc,
+        "val_acc": val_acc,
+        "tta_val_acc": tta_val_acc,
+        "total_time_seconds": eval_total_time_seconds,
+    }
+    print_training_details(eval_vars, is_final_entry=True)
 
     run_log = {
         "run": int(run_id) if run_id != "warmup" else "warmup",
         "seed": int(seed),
         "tta_val_acc": float(tta_val_acc),
+        # still training-only time
         "total_time_seconds": float(total_time_seconds),
         "history": history,
     }

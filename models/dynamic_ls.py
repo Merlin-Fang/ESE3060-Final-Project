@@ -60,6 +60,7 @@ hyp = {
         'weight_decay': 0.0153,     # weight decay per 1024 examples (decoupled from learning rate)
         'bias_scaler': 64.0,        # scales up learning rate (but not weight decay) for BatchNorm biases
         'label_smoothing': 0.2,
+        'label_smoothing_final': 0.0,  # final label smoothing at the end of training
         'whiten_bias_epochs': 3,    # how many epochs to train the whitening layer bias before freezing
     },
     'aug': {
@@ -95,18 +96,6 @@ def set_global_seed(seed: int):
 
 CIFAR_MEAN = torch.tensor((0.4914, 0.4822, 0.4465))
 CIFAR_STD = torch.tensor((0.2470, 0.2435, 0.2616))
-TRANSLATE_OFFSETS = [
-    (0, 0),   # center
-    (-1, -1),
-    (1, 1),
-    (-1, 1),
-    (1, -1),
-    (-2, 0),
-    (2, 0),
-    (0, -2),
-    (0, 2),
-    (0, 0),   # maybe revisit center at the very end
-]
 
 def batch_flip_lr(inputs):
     flip_mask = (torch.rand(len(inputs), device=inputs.device) < 0.5).view(-1, 1, 1, 1)
@@ -175,20 +164,7 @@ class CifarLoader:
                 self.proc_images['pad'] = F.pad(images, (pad,)*4, 'reflect')
 
         if self.aug.get('translate', 0) > 0:
-            pad = self.aug['translate']
-            padded = self.proc_images['pad']  # [N, 3, 32+2*pad, 32+2*pad]
-            crop_size = self.images.shape[-2]
-            max_shift = pad
-
-            # Deterministic offset based on epoch index
-            dy, dx = TRANSLATE_OFFSETS[self.epoch % len(TRANSLATE_OFFSETS)]
-            dy = max(-max_shift, min(max_shift, dy))
-            dx = max(-max_shift, min(max_shift, dx))
-
-            r = max_shift
-            y0 = r + dy
-            x0 = r + dx
-            images = padded[:, :, y0:y0+crop_size, x0:x0+crop_size]
+            images = batch_crop(self.proc_images['pad'], self.images.shape[-2])
         elif self.aug.get('flip', False):
             images = self.proc_images['flip']
         else:
@@ -395,6 +371,29 @@ def evaluate(model, loader, tta_level=0):
     logits = infer(model, loader, tta_level)
     return (logits.argmax(1) == loader.labels).float().mean().item()
 
+def label_smoothing_loss(logits, targets, smoothing, num_classes=10):
+    """
+    Per-example cross-entropy with label smoothing.
+    logits: [N, num_classes]
+    targets: [N] int64
+    smoothing: float in [0, 1)
+    returns: [N] loss values, one per example
+    """
+    # Work in float32 for numerical stability
+    logits = logits.float()
+    log_probs = F.log_softmax(logits, dim=1)
+
+    if smoothing <= 0.0:
+        # Standard NLL loss without smoothing
+        return F.nll_loss(log_probs, targets, reduction="none")
+
+    with torch.no_grad():
+        true_dist = torch.zeros_like(log_probs)
+        true_dist.fill_(smoothing / (num_classes - 1))
+        true_dist.scatter_(1, targets.unsqueeze(1), 1.0 - smoothing)
+
+    return (-true_dist * log_probs).sum(dim=1)
+
 ############################################
 #                Training                  #
 ############################################
@@ -419,8 +418,9 @@ def main(run):
     lr = hyp['opt']['lr'] / kilostep_scale # un-decoupled learning rate for PyTorch SGD
     wd = hyp['opt']['weight_decay'] * batch_size / kilostep_scale
     lr_biases = lr * hyp['opt']['bias_scaler']
-
-    loss_fn = nn.CrossEntropyLoss(label_smoothing=hyp['opt']['label_smoothing'], reduction='none')
+    ls_start = hyp['opt']['label_smoothing']
+    ls_end = hyp['opt']['label_smoothing_final']
+    num_classes = 10
     test_loader = CifarLoader(CIFAR_ROOT, train=False, batch_size=2000)
     train_loader = CifarLoader(CIFAR_ROOT, train=True, batch_size=batch_size, aug=hyp['aug'])
     if run == 'warmup':
@@ -478,8 +478,14 @@ def main(run):
         model.train()
         for inputs, labels in train_loader:
 
+            # Compute current label smoothing based on training progress
+            progress = current_steps / total_train_steps
+            smoothing = ls_start + (ls_end - ls_start) * progress
+
             outputs = model(inputs)
-            loss = loss_fn(outputs, labels).sum()
+            per_example_loss = label_smoothing_loss(outputs, labels, smoothing, num_classes=num_classes)
+            loss = per_example_loss.sum()
+
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
@@ -509,11 +515,15 @@ def main(run):
         val_acc = evaluate(model, test_loader, tta_level=0)
         print_training_details(locals(), is_final_entry=False)
         run = None # Only print the run number once
+        epoch_progress = current_steps / total_train_steps
+        epoch_smoothing = ls_start + (ls_end - ls_start) * epoch_progress
+
         history.append({
             "epoch": int(epoch),
             "train_loss": float(train_loss),
             "train_acc": float(train_acc),
             "val_acc": float(val_acc),
+            "label_smoothing": float(epoch_smoothing),
             "total_time_seconds": float(total_time_seconds),
         })
 
@@ -555,12 +565,11 @@ def main(run):
 
     return run_log
 
-
 if __name__ == "__main__":
     with open(sys.argv[0]) as f:
         code = f.read()
 
-    exp_name = "alt_translate"
+    exp_name = "dynamic_ls"
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
 
     log_dir = os.path.join(PROJECT_ROOT, "logs", exp_name, run_id)
