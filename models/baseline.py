@@ -18,6 +18,9 @@ import numpy as np
 import uuid
 from math import ceil
 
+from datetime import datetime
+from tqdm import tqdm
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -25,6 +28,17 @@ import torchvision
 import torchvision.transforms as T
 
 torch.backends.cudnn.benchmark = True
+
+class Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+        self.flush()
+    def flush(self):
+        for s in self.streams:
+            s.flush()
 
 # We express the main training hyperparameters (batch size, learning rate, momentum, and weight decay)
 # in decoupled form, so that each one can be tuned independently. This accomplishes the following:
@@ -64,6 +78,9 @@ hyp = {
         'tta_level': 2,         # the level of test-time augmentation: 0=none, 1=mirror, 2=mirror+translate
     },
 }
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CIFAR_ROOT = os.path.join(PROJECT_ROOT, "cifar10")
 
 BASE_SEED = 0
 
@@ -380,8 +397,8 @@ def main(run):
     lr_biases = lr * hyp['opt']['bias_scaler']
 
     loss_fn = nn.CrossEntropyLoss(label_smoothing=hyp['opt']['label_smoothing'], reduction='none')
-    test_loader = CifarLoader('cifar10', train=False, batch_size=2000)
-    train_loader = CifarLoader('cifar10', train=True, batch_size=batch_size, aug=hyp['aug'])
+    test_loader = CifarLoader(CIFAR_ROOT, train=False, batch_size=2000)
+    train_loader = CifarLoader(CIFAR_ROOT, train=True, batch_size=batch_size, aug=hyp['aug'])
     if run == 'warmup':
         # The only purpose of the first run is to warmup, so we can use dummy data
         train_loader.labels = torch.randint(0, 10, size=(len(train_loader.labels),), device=train_loader.labels.device)
@@ -480,11 +497,7 @@ def main(run):
     #  TTA Evaluation  #
     ####################
 
-    starter.record()
     tta_val_acc = evaluate(model, test_loader, tta_level=hyp['net']['tta_level'])
-    ender.record()
-    torch.cuda.synchronize()
-    total_time_seconds += 1e-3 * starter.elapsed_time(ender)
 
     epoch = 'eval'
     print_training_details(locals(), is_final_entry=True)
@@ -503,18 +516,33 @@ if __name__ == "__main__":
     with open(sys.argv[0]) as f:
         code = f.read()
 
-    print_columns(logging_columns_list, is_head=True)
-    # main('warmup')  # optional warmup, can leave commented
-
-    run_logs = [main(run) for run in range(25)]
-
-    accs = torch.tensor([rl["tta_val_acc"] for rl in run_logs])
-    times = torch.tensor([rl["total_time_seconds"] for rl in run_logs])
-
-    print("Mean accuracy: %.4f    Std: %.4f" % (accs.mean(), accs.std()))
-    print("Mean time (s): %.4f    Std: %.4f" % (times.mean(), times.std()))
-
     exp_name = "baseline"
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    log_dir = os.path.join(PROJECT_ROOT, "logs", exp_name, run_id)
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "log.pt")
+    txt_path = os.path.join(log_dir, "log.txt")
+
+    # Tee stdout to both terminal and log.txt
+    orig_stdout = sys.stdout
+    with open(txt_path, "w") as f_txt:
+        sys.stdout = Tee(orig_stdout, f_txt)
+
+        print_columns(logging_columns_list, is_head=True)
+        # main('warmup')  # optional warmup, can leave commented
+
+        run_logs = [main(run) for run in tqdm(range(25), desc="Baseline runs")]
+
+        accs = torch.tensor([rl["tta_val_acc"] for rl in run_logs])
+        times = torch.tensor([rl["total_time_seconds"] for rl in run_logs])
+
+        print("Mean accuracy: %.4f    Std: %.4f" % (accs.mean(), accs.std()))
+        print("Mean training time (s): %.4f    Std: %.4f" % (times.mean(), times.std()))
+        print(os.path.abspath(log_path))
+
+        # restore stdout
+        sys.stdout = orig_stdout
 
     log = {
         "exp_name": exp_name,
@@ -523,9 +551,4 @@ if __name__ == "__main__":
         "accs": accs,
         "times": times,
     }
-    log_dir = os.path.join("logs", exp_name, str(uuid.uuid4()))
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, "log.pt")
-
-    print(os.path.abspath(log_path))
     torch.save(log, log_path)
