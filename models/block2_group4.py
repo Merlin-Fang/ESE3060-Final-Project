@@ -19,6 +19,7 @@ import numpy as np
 from math import ceil
 
 from datetime import datetime
+import argparse  # NEW
 
 import torch
 from torch import nn
@@ -549,11 +550,29 @@ def main(run):
 
     return run_log
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train_epochs", type=float, default=hyp['opt']['train_epochs'])
+    parser.add_argument("--lr", type=float, default=hyp['opt']['lr'])
+    parser.add_argument("--weight_decay", type=float, default=hyp['opt']['weight_decay'])
+    parser.add_argument("--label_smoothing", type=float, default=hyp['opt']['label_smoothing'])
+    parser.add_argument("--n_runs", type=int, default=6)
+    parser.add_argument("--exp_name", type=str, default="block2_group4")
+    return parser.parse_args()
+
 if __name__ == "__main__":
+    args = parse_args()
+
+    # Override hypers from CLI
+    hyp['opt']['train_epochs'] = args.train_epochs
+    hyp['opt']['lr'] = args.lr
+    hyp['opt']['weight_decay'] = args.weight_decay
+    hyp['opt']['label_smoothing'] = args.label_smoothing
+
     with open(sys.argv[0]) as f:
         code = f.read()
 
-    exp_name = "block2_group4"
+    exp_name = args.exp_name
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
 
     log_dir = os.path.join(PROJECT_ROOT, "logs", exp_name, run_id)
@@ -569,8 +588,9 @@ if __name__ == "__main__":
         print_columns(logging_columns_list, is_head=True)
         # main('warmup')  # optional warmup, can leave commented
 
-        run_logs = [main(run) for run in range(25)]
+        run_logs = [main(run) for run in range(args.n_runs)]
 
+        # Keep your existing behavior of dropping the first run
         effective_logs = run_logs[1:]
 
         accs = torch.tensor([rl["tta_val_acc"] for rl in effective_logs])
