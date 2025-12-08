@@ -61,8 +61,6 @@ hyp = {
         'bias_scaler': 64.0,        # scales up learning rate (but not weight decay) for BatchNorm biases
         'label_smoothing': 0.2,
         'whiten_bias_epochs': 3,    # how many epochs to train the whitening layer bias before freezing
-        'whiten_unfreeze_epoch': 7,  # NEW: start training whitening conv weights at epoch 7
-        'whiten_lr_scale': 0.2,   # train whitening conv with 0.2x main LR, no weight decay
     },
     'aug': {
         'flip': True,
@@ -77,6 +75,7 @@ hyp = {
         'batchnorm_momentum': 0.6,
         'scaling_factor': 1/9,
         'tta_level': 2,         # the level of test-time augmentation: 0=none, 1=mirror, 2=mirror+translate
+        'block2_groups': 4,     # NEW: number of groups for block2 conv2
     },
 }
 
@@ -206,23 +205,36 @@ class BatchNorm(nn.BatchNorm2d):
         # Note that PyTorch already initializes the weights to one and bias to zero
 
 class Conv(nn.Conv2d):
-    def __init__(self, in_channels, out_channels, kernel_size=3, padding='same', bias=False):
-        super().__init__(in_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=bias)
+    def __init__(self, in_channels, out_channels, kernel_size=3, padding='same', bias=False, groups=1):
+        super().__init__(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            bias=bias,
+            groups=groups,
+        )
+        self.groups = groups
 
     def reset_parameters(self):
         super().reset_parameters()
         if self.bias is not None:
             self.bias.data.zero_()
         w = self.weight.data
-        torch.nn.init.dirac_(w[:w.size(1)])
+        if self.groups == 1:
+            # Preserve original behavior for standard convs
+            torch.nn.init.dirac_(w[:w.size(1)])
+        else:
+            # For grouped convs, use a standard Kaiming initialization
+            torch.nn.init.kaiming_normal_(w, mode="fan_out", nonlinearity="relu")
 
 class ConvGroup(nn.Module):
-    def __init__(self, channels_in, channels_out, batchnorm_momentum):
+    def __init__(self, channels_in, channels_out, batchnorm_momentum, conv2_groups=1):
         super().__init__()
         self.conv1 = Conv(channels_in,  channels_out)
         self.pool = nn.MaxPool2d(2)
         self.norm1 = BatchNorm(channels_out, batchnorm_momentum)
-        self.conv2 = Conv(channels_out, channels_out)
+        self.conv2 = Conv(channels_out, channels_out, groups=conv2_groups)
         self.norm2 = BatchNorm(channels_out, batchnorm_momentum)
         self.activ = nn.GELU()
 
@@ -249,7 +261,12 @@ def make_net():
         Conv(3, whiten_width, whiten_kernel_size, padding=0, bias=True),
         nn.GELU(),
         ConvGroup(whiten_width,     widths['block1'], batchnorm_momentum),
-        ConvGroup(widths['block1'], widths['block2'], batchnorm_momentum),
+        ConvGroup(
+            widths['block1'],
+            widths['block2'],
+            batchnorm_momentum,
+            conv2_groups=hyp['net']['block2_groups'],  # NEW
+        ),
         ConvGroup(widths['block2'], widths['block3'], batchnorm_momentum),
         nn.MaxPool2d(3),
         Flatten(),
@@ -396,7 +413,6 @@ def main(run):
     lr = hyp['opt']['lr'] / kilostep_scale # un-decoupled learning rate for PyTorch SGD
     wd = hyp['opt']['weight_decay'] * batch_size / kilostep_scale
     lr_biases = lr * hyp['opt']['bias_scaler']
-    whiten_lr = lr * hyp['opt']['whiten_lr_scale']
 
     loss_fn = nn.CrossEntropyLoss(label_smoothing=hyp['opt']['label_smoothing'], reduction='none')
     test_loader = CifarLoader(CIFAR_ROOT, train=False, batch_size=2000)
@@ -409,29 +425,10 @@ def main(run):
     model = make_net()
     current_steps = 0
 
-    # Separate param groups:
-    #  - whitening conv weights (model[0].weight)
-    #  - BatchNorm biases ("norm" in name)
-    #  - all other trainable parameters
-    whiten_params = [model[0].weight]
-    norm_biases = []
-    other_params = []
-
-    for name, p in model.named_parameters():
-        if p is model[0].weight:
-            # already in whiten_params
-            continue
-        if 'norm' in name and p.requires_grad:
-            norm_biases.append(p)
-        elif p.requires_grad:
-            other_params.append(p)
-
-    param_configs = [
-        dict(params=whiten_params, lr=whiten_lr, weight_decay=0.0),            # whitening conv: small LR, no WD
-        dict(params=norm_biases,  lr=lr_biases, weight_decay=wd / lr_biases),  # BN biases
-        dict(params=other_params, lr=lr,        weight_decay=wd),              # everything else
-    ]
-
+    norm_biases = [p for k, p in model.named_parameters() if 'norm' in k and p.requires_grad]
+    other_params = [p for k, p in model.named_parameters() if 'norm' not in k and p.requires_grad]
+    param_configs = [dict(params=norm_biases, lr=lr_biases, weight_decay=wd/lr_biases),
+                     dict(params=other_params, lr=lr, weight_decay=wd/lr)]
     optimizer = torch.optim.SGD(param_configs, momentum=momentum, nesterov=True)
 
     def get_lr(step):
@@ -464,14 +461,7 @@ def main(run):
 
     for epoch in range(ceil(epochs)):
 
-        # Biases: train for a few epochs, then freeze (original behavior)
         model[0].bias.requires_grad = (epoch < hyp['opt']['whiten_bias_epochs'])
-
-        # NEW: late unfreezing of whitening conv weights
-        if epoch >= hyp['opt']['whiten_unfreeze_epoch']:
-            model[0].weight.requires_grad = True
-        else:
-            model[0].weight.requires_grad = False
 
         ####################
         #     Training     #
@@ -518,7 +508,6 @@ def main(run):
             "train_loss": float(train_loss),
             "train_acc": float(train_acc),
             "val_acc": float(val_acc),
-            "whiten_trainable": bool(model[0].weight.requires_grad),
             "total_time_seconds": float(total_time_seconds),
         })
 
@@ -564,7 +553,7 @@ if __name__ == "__main__":
     with open(sys.argv[0]) as f:
         code = f.read()
 
-    exp_name = "whiten_unfreeze"
+    exp_name = "block2_group4"
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
 
     log_dir = os.path.join(PROJECT_ROOT, "logs", exp_name, run_id)
