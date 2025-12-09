@@ -556,7 +556,10 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=hyp['opt']['lr'])
     parser.add_argument("--weight_decay", type=float, default=hyp['opt']['weight_decay'])
     parser.add_argument("--label_smoothing", type=float, default=hyp['opt']['label_smoothing'])
-    parser.add_argument("--n_runs", type=int, default=6)
+    parser.add_argument("--n_runs", type=int, default=25)
+    parser.add_argument("--block1", type=int, default=64)
+    parser.add_argument("--block2", type=int, default=256)
+    parser.add_argument("--block3", type=int, default=256)
     parser.add_argument("--exp_name", type=str, default="block2_group4")
     return parser.parse_args()
 
@@ -568,6 +571,9 @@ if __name__ == "__main__":
     hyp['opt']['lr'] = args.lr
     hyp['opt']['weight_decay'] = args.weight_decay
     hyp['opt']['label_smoothing'] = args.label_smoothing
+    hyp['net']['widths']['block1'] = args.block1
+    hyp['net']['widths']['block2'] = args.block2
+    hyp['net']['widths']['block3'] = args.block3
 
     with open(sys.argv[0]) as f:
         code = f.read()
